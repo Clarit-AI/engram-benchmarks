@@ -30,6 +30,7 @@ from typing import List, Literal, Optional
 from .compute_amort import ComputeAmortization
 
 RestoreMode = Literal["warm", "cold"]
+SnapshotMode = Literal["mamba_only", "kv_capturing"]
 
 
 @dataclass
@@ -52,6 +53,9 @@ class BaseResult:
     engram_output_tokens: int
     engram_answer: str
     engram_score: float
+
+    # Run-level tag — kept last so subclass fields with defaults stay valid
+    snapshot_mode: SnapshotMode = "mamba_only"
 
     # ------------------------------------------------------------------ #
     # Derived metrics                                                      #
