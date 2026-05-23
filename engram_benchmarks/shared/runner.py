@@ -166,6 +166,14 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
     @abstractmethod
     def _extra_result_fields(self, item: ItemT) -> dict: ...
 
+    def _scorer_for(self, item: ItemT) -> "BaseScorer":
+        """Return the scorer to use for this item.
+
+        Override this when scoring varies per item (e.g. RULER uses different
+        match strategies per task_name).  Default returns ``self.scorer``.
+        """
+        return self.scorer
+
     # ------------------------------------------------------------------ #
     # Snapshot helpers                                                     #
     # ------------------------------------------------------------------ #
@@ -282,8 +290,9 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
             ref = self._reference_answer(item)
 
             # 1. Baseline
+            scorer = self._scorer_for(item)
             b = self._call(full_prompt)
-            b_score = self.scorer.score(b.text, ref)
+            b_score = scorer.score(b.text, ref)
 
             # 2. Cold pass — establish snapshot
             cold_result = self._call(full_prompt)
@@ -306,7 +315,7 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
                 restore_mode = "warm"
                 w = self._call(warm_prompt)
 
-            w_score = self.scorer.score(w.text, ref)
+            w_score = scorer.score(w.text, ref)
             extra = self._extra_result_fields(item)
 
             results.append(
@@ -342,7 +351,7 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
             full_prompt = self._build_full_prompt(item)
             ref = self._reference_answer(item)
             b = self._call(full_prompt)
-            b_score = self.scorer.score(b.text, ref)
+            b_score = self._scorer_for(item).score(b.text, ref)
             extra = self._extra_result_fields(item)
             results.append(
                 self._result_cls(
