@@ -7,9 +7,9 @@ protocol:
   2. Cold Engram pass — full context, saves snapshot stub.
   3. Warm Engram pass — question only, snapshot present → warm score + TTFT.
 
-The base class ``run_all`` instantiates ``BaseResult`` directly, which cannot
-carry RULER-specific fields.  ``RULERRunner`` overrides ``run_all`` to produce
-``RULERResult`` instances using the same three-pass protocol.
+``_result_cls = RULERResult`` routes ``BaseTwoPhaseRunner.run_all`` to produce
+``RULERResult`` instances without a subclass override.  ``_scorer_for`` swaps
+the match strategy per task_name (string_match_all vs string_match_part).
 
 Usage (dry-run)::
 
@@ -31,9 +31,10 @@ from typing import Any, List, Optional
 
 from engram_benchmarks.shared.http_client import MockHttpFn, make_dry_run_mock
 from engram_benchmarks.shared.runner import BaseTwoPhaseRunner
+from engram_benchmarks.shared.scoring import BaseScorer
 
 from .results import RULERResult, RULERRunSummary
-from .scoring import get_scorer
+from .scoring import StringMatchAllScorer, get_scorer
 from .tasks import (
     CONTEXT_LENGTHS,
     RULER_TASKS,
@@ -60,6 +61,8 @@ class RULERRunner(BaseTwoPhaseRunner[TaskInstance]):
     mock_fn:
         Inject a mock HTTP function for dry-run / unit tests.
     """
+
+    _result_cls = RULERResult
 
     # ------------------------------------------------------------------ #
     # BaseTwoPhaseRunner abstract interface                                #
@@ -96,70 +99,14 @@ class RULERRunner(BaseTwoPhaseRunner[TaskInstance]):
         }
 
     def _extra_result_fields(self, item: TaskInstance) -> dict:
-        # Not used directly (run_all is overridden), but required by ABC.
         return {
             "task_name": item.task_name,
             "context_length": item.context_length,
         }
 
-    # ------------------------------------------------------------------ #
-    # Override run_all to produce RULERResult instances                   #
-    # ------------------------------------------------------------------ #
-
-    def run_all(self, items: List[TaskInstance]) -> List[RULERResult]:  # type: ignore[override]
-        """Run the full three-pass protocol and return ``RULERResult`` list.
-
-        Mirrors ``BaseTwoPhaseRunner.run_all`` exactly but:
-        - Swaps the scorer per item using ``get_scorer(task_name)``.
-        - Constructs ``RULERResult`` (not ``BaseResult``) with task fields.
-        """
-        results: List[RULERResult] = []
-        for item in items:
-            item_id = self._item_id(item)
-            full_prompt = self._build_full_prompt(item)
-            warm_prompt = self._build_warm_prompt(item)
-            ref = self._reference_answer(item)
-            scorer = get_scorer(item.task_name)
-
-            # --- 1. Baseline ---
-            b = self._call(full_prompt)
-            b_score = scorer.score(b.text, ref)
-
-            # --- 2. Cold Engram pass (establishes snapshot; metrics not reported) ---
-            self._call(full_prompt)
-            self._write_snapshot(item, full_prompt)
-
-            # --- 3. Warm Engram pass (snapshot now present) ---
-            assert self._snap_exists(item), "Snapshot must exist after cold pass"
-            w = self._call(warm_prompt)
-            w_score = scorer.score(w.text, ref)
-
-            results.append(
-                RULERResult(
-                    item_id=item_id,
-                    restore_mode="warm",
-                    baseline_ttft_s=b.ttft_s,
-                    baseline_input_tokens=b.input_tokens,
-                    baseline_output_tokens=b.output_tokens,
-                    baseline_answer=b.text,
-                    baseline_score=b_score,
-                    engram_ttft_s=w.ttft_s,
-                    engram_input_tokens=w.input_tokens,
-                    engram_output_tokens=w.output_tokens,
-                    engram_answer=w.text,
-                    engram_score=w_score,
-                    task_name=item.task_name,
-                    context_length=item.context_length,
-                )
-            )
-            logger.info(
-                "%s | baseline_ttft=%.3fs warm_ttft=%.3fs token_reduction=%.2f",
-                item_id,
-                b.ttft_s,
-                w.ttft_s,
-                results[-1].token_reduction,
-            )
-        return results
+    def _scorer_for(self, item: TaskInstance) -> BaseScorer:
+        """Per-task scorer: RULER uses different match strategies per task_name."""
+        return get_scorer(item.task_name)
 
 
 # ------------------------------------------------------------------ #
@@ -207,7 +154,6 @@ def run_ruler(
     sample_indices = sample_indices or [0]
     snapshot_dir = snapshot_dir or Path("/tmp/ruler_snapshots")
 
-    # Generate all task instances.
     items: List[TaskInstance] = []
     for task_name in task_names:
         for ctx_len in context_lengths:
@@ -216,12 +162,10 @@ def run_ruler(
 
     logger.info("Generated %d RULER task instances.", len(items))
 
-    from .scoring import StringMatchAllScorer
-
     runner = RULERRunner(
         model_url=model_url,
         snapshot_dir=snapshot_dir,
-        scorer=StringMatchAllScorer(),  # overridden per-item in run_all
+        scorer=StringMatchAllScorer(),  # default; _scorer_for overrides per item
         model=model,
         mock_fn=mock_fn,
     )
