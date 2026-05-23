@@ -36,7 +36,6 @@ from typing import Any, List, Optional
 
 from engram_benchmarks.shared.http_client import MockHttpFn
 from engram_benchmarks.shared.runner import BaseTwoPhaseRunner
-from engram_benchmarks.shared.results import BaseResult
 
 from .scoring import SetF1Scorer
 from .results import GraphWalksResult
@@ -60,6 +59,8 @@ class Question:
 
 class GraphWalksRunner(BaseTwoPhaseRunner[Question]):
     """Two-phase runner for the GraphWalks benchmark."""
+
+    _result_cls = GraphWalksResult
 
     def __init__(
         self,
@@ -113,67 +114,6 @@ class GraphWalksRunner(BaseTwoPhaseRunner[Question]):
             "graph_size": item.num_nodes,
             "num_hops": item.num_hops,
         }
-
-    # ------------------------------------------------------------------ #
-    # Override run_all to emit GraphWalksResult instead of BaseResult     #
-    # ------------------------------------------------------------------ #
-
-    def run_all(self, items: List[Question]) -> List[GraphWalksResult]:  # type: ignore[override]
-        """Run baseline + cold + warm for each question, returning GraphWalksResult.
-
-        Mirrors the BaseTwoPhaseRunner three-pass protocol:
-          1. Baseline  — full context, no snapshot
-          2. Cold pass — full context, saves snapshot (NOT reported as warm)
-          3. Warm pass — question only, snapshot present (reported as warm)
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        results: List[GraphWalksResult] = []
-        for item in items:
-            item_id = self._item_id(item)
-            full_prompt = self._build_full_prompt(item)
-            warm_prompt = self._build_warm_prompt(item)
-            ref = self._reference_answer(item)
-
-            # --- 1. Baseline ---
-            b = self._call(full_prompt)
-            b_score = self.scorer.score(b.text, ref)
-
-            # --- 2. Cold Engram pass (establishes snapshot; metrics not reported) ---
-            self._call(full_prompt)
-            self._write_snapshot(item, full_prompt)
-
-            # --- 3. Warm Engram pass (snapshot now present) ---
-            assert self._snap_exists(item), "Snapshot must exist after cold pass"
-            w = self._call(warm_prompt)
-            w_score = self.scorer.score(w.text, ref)
-
-            result = GraphWalksResult(
-                item_id=item_id,
-                restore_mode="warm",
-                baseline_ttft_s=b.ttft_s,
-                baseline_input_tokens=b.input_tokens,
-                baseline_output_tokens=b.output_tokens,
-                baseline_answer=b.text,
-                baseline_score=b_score,
-                engram_ttft_s=w.ttft_s,
-                engram_input_tokens=w.input_tokens,
-                engram_output_tokens=w.output_tokens,
-                engram_answer=w.text,
-                engram_score=w_score,
-                graph_size=item.num_nodes,
-                num_hops=item.num_hops,
-            )
-            results.append(result)
-            logger.info(
-                "%s | baseline_ttft=%.3fs warm_ttft=%.3fs token_reduction=%.2f",
-                item_id,
-                b.ttft_s,
-                w.ttft_s,
-                result.token_reduction,
-            )
-        return results
 
 
 # ------------------------------------------------------------------ #
