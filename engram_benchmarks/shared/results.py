@@ -30,6 +30,7 @@ from typing import List, Literal, Optional
 from .compute_amort import ComputeAmortization
 
 RestoreMode = Literal["warm", "cold"]
+SnapshotMode = Literal["mamba_only", "kv_capturing"]
 
 
 @dataclass
@@ -52,6 +53,14 @@ class BaseResult:
     engram_output_tokens: int
     engram_answer: str
     engram_score: float
+
+    # Snapshot metadata
+    snapshot_mode: SnapshotMode = "mamba_only"
+    # Tracks whether the /restore_snapshot RPC actually succeeded.
+    # False means the runner fell back to the full prompt; any content match
+    # on that result is a false positive, not proof of warm restore.
+    # Always True in dry-run mode (stub path never fails).
+    restore_success: bool = True
 
     # ------------------------------------------------------------------ #
     # Derived metrics                                                      #
@@ -122,6 +131,9 @@ class BaseResult:
     def from_dict(cls, d: dict) -> "BaseResult":
         for k in ("token_reduction", "ttft_speedup", "tokens_saved"):
             d.pop(k, None)
+        # snapshot_mode and restore_success were added later; tolerate old records.
+        d.setdefault("snapshot_mode", "mamba_only")
+        d.setdefault("restore_success", True)
         return cls(**d)
 
 
@@ -147,7 +159,16 @@ class RunSummary:
 
     @property
     def warm_results(self) -> List[BaseResult]:
-        return [r for r in self.results if r.restore_mode == "warm"]
+        """Warm results where the restore actually succeeded.
+
+        Results where restore failed (restore_success=False) are excluded even
+        if restore_mode was labelled "warm" — they fell back to the full prompt
+        and their content match would be a false positive.
+        """
+        return [
+            r for r in self.results
+            if r.restore_mode == "warm" and r.restore_success
+        ]
 
     @property
     def cold_results(self) -> List[BaseResult]:

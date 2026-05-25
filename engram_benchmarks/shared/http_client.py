@@ -42,6 +42,7 @@ def chat_completion(
     temperature: float = 0.0,
     timeout: float = 120.0,
     input_token_count: int = 0,
+    rid: Optional[str] = None,
     mock_fn: Optional[MockHttpFn] = None,
 ) -> ChatResult:
     """Send a streaming chat completion and return a ChatResult.
@@ -62,6 +63,11 @@ def chat_completion(
         HTTP request timeout in seconds.
     input_token_count:
         Pre-computed input token count (from caller; avoids re-tokenising).
+    rid:
+        Optional request ID to embed in the payload.  When provided, the
+        Engram server tracks the request under this key so a subsequent
+        ``/save_snapshot`` call with ``rid=<same>`` can locate the state.
+        Omit for baseline and warm passes; always set for the cold pass.
     mock_fn:
         If provided, called instead of making an HTTP request.  Signature:
         ``(model_url, messages, model) -> ChatResult``.  Used by tests.
@@ -75,13 +81,15 @@ def chat_completion(
         raise RuntimeError("'requests' is required for live HTTP calls.") from exc
 
     url = model_url.rstrip("/") + "/v1/chat/completions"
-    payload = {
+    payload: dict = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": True,  # always stream; TTFT requires first-token timing
     }
+    if rid is not None:
+        payload["rid"] = rid
     headers = {"Content-Type": "application/json"}
 
     t_start = time.perf_counter()
