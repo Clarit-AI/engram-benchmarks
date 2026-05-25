@@ -221,15 +221,16 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
     def _server_save_snapshot(self, item: ItemT, rid: str) -> str:
         """POST /save_snapshot and return the real server-assigned RID.
 
-        The server response may echo back the rid, a snapshot_id, or a
-        conversation_id.  We prefer snapshot_id, then conversation_id, then
-        fall back to the rid we sent.  This returned value is what must be
-        passed to /restore_snapshot as conversation_id.
+        The server response may echo back a conversation_id, rid, or
+        snapshot_id.  We prefer conversation_id, then rid, then fall back to
+        the rid we sent at save time.  snapshot_id is a derived "<conv_id>-t0"
+        value that the engine does NOT index by — using it as conversation_id
+        in /restore_snapshot returns HTTP 500 "No snapshots found."
 
         Returns
         -------
         str
-            The server-confirmed RID / snapshot_id to use in restore_snapshot.
+            The save-time conversation_id / rid to pass to restore_snapshot.
             Returns the empty string on failure (caller should treat as failure).
         """
         branch = self._branch_name(item)
@@ -245,11 +246,11 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
             )
             return ""
 
-        # Prefer snapshot_id from the server response; fall back to the rid we sent.
+        # Prefer the save-time conversation_id; snapshot_id is a derived value the
+        # engine does NOT index by and will return HTTP 500 if used for restore.
         server_rid = (
-            result.get("snapshot_id")
+            result.get("conversation_id")
             or result.get("rid")
-            or result.get("conversation_id")
             or rid
         )
         logger.info(

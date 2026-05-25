@@ -174,12 +174,24 @@ class TestRestoreSnapshotRequestShape:
         )
 
     def test_conversation_id_is_real_server_rid_not_item_id(self, tmp_path):
-        """The conversation_id in restore_snapshot must be the real server RID, not item_id."""
+        """The conversation_id in restore_snapshot must be the save-time conversation_id.
+
+        GPU-verified (2026-05-25): the engine indexes snapshots by the conversation_id
+        passed at save time.  The save response includes both snapshot_id
+        ("<conv_id>-t0", a derived value) and conversation_id.  We must prefer
+        conversation_id — using snapshot_id returns HTTP 500 "No snapshots found."
+        """
         item = _Item("item-0", "Context", "Question?", "Answer")
         runner = _make_runner(tmp_path)
 
-        real_server_rid = "server-assigned-rid-deadbeef"
-        save_resp = {"success": True, "snapshot_id": real_server_rid}
+        real_server_conv_id = "server-assigned-conv-deadbeef"
+        derived_snapshot_id = f"{real_server_conv_id}-t0"
+        # Simulate a real engine response that has BOTH fields.
+        save_resp = {
+            "success": True,
+            "conversation_id": real_server_conv_id,
+            "snapshot_id": derived_snapshot_id,  # derived — must NOT win
+        }
         restore_resp = {"success": True, "output_text": "Answer"}
 
         with (
@@ -195,13 +207,17 @@ class TestRestoreSnapshotRequestShape:
         mock_restore.assert_called_once()
         kwargs = mock_restore.call_args.kwargs
         conv_id = kwargs.get("conversation_id")
-        assert conv_id == real_server_rid, (
-            f"conversation_id must be the real server RID '{real_server_rid}', "
-            f"not the harness item_id 'item-0'. Got: '{conv_id}'"
+        assert conv_id == real_server_conv_id, (
+            f"conversation_id must be the save-time conversation_id "
+            f"'{real_server_conv_id}', not the derived snapshot_id "
+            f"'{derived_snapshot_id}' nor the harness item_id 'item-0'. Got: '{conv_id}'"
+        )
+        assert conv_id != derived_snapshot_id, (
+            f"snapshot_id ('{derived_snapshot_id}') is a derived '<conv_id>-t0' value "
+            "that the engine does NOT index by — using it returns HTTP 500."
         )
         assert conv_id != "item-0", (
-            "The harness item_id 'item-0' must NOT be passed as conversation_id — "
-            "it's not a real server RID."
+            "The harness item_id 'item-0' must NOT be passed as conversation_id."
         )
 
     def test_continuation_ids_is_nonempty_list_of_ints(self, tmp_path):
@@ -283,13 +299,19 @@ class TestRestoreSnapshotRequestShape:
 class TestRidCapture:
     """The real server RID must be captured from the save_snapshot response."""
 
-    def test_snapshot_id_from_save_response_used_as_conversation_id(self, tmp_path):
-        """snapshot_id from /save_snapshot response becomes conversation_id."""
+    def test_snapshot_id_in_save_response_is_not_used_as_conversation_id(self, tmp_path):
+        """snapshot_id from /save_snapshot response must NOT become conversation_id.
+
+        Regression: snapshot_id is a derived "<conv_id>-t0" value the engine does
+        NOT index by.  When the save response has no conversation_id or rid, we fall
+        back to the rid WE sent at save time — which IS the save-time conversation_id.
+        """
         item = _Item("q1", "Context", "Question?", "Answer")
         runner = _make_runner(tmp_path)
 
-        server_snapshot_id = "snap-cafebabe-1234"
-        save_resp = {"success": True, "snapshot_id": server_snapshot_id}
+        derived_snapshot_id = "snap-cafebabe-1234-t0"
+        # Save response has ONLY snapshot_id — no conversation_id, no rid.
+        save_resp = {"success": True, "snapshot_id": derived_snapshot_id}
         restore_resp = {"success": True, "output_text": "Answer"}
 
         with (
@@ -303,7 +325,14 @@ class TestRidCapture:
             runner.run_all([item])
 
         kwargs = mock_restore.call_args.kwargs
-        assert kwargs["conversation_id"] == server_snapshot_id
+        conv_id = kwargs["conversation_id"]
+        # Falls back to the rid we sent (item_id) — the save-time conversation_id.
+        assert conv_id != derived_snapshot_id, (
+            f"snapshot_id '{derived_snapshot_id}' must not be used as conversation_id."
+        )
+        assert conv_id == "q1", (
+            f"Should fall back to the rid sent at save time ('q1'), got '{conv_id}'"
+        )
 
     def test_rid_field_fallback_when_no_snapshot_id(self, tmp_path):
         """When save_snapshot returns rid but no snapshot_id, use rid."""
