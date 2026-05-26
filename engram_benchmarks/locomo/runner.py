@@ -23,16 +23,16 @@ from __future__ import annotations
 
 import json
 import textwrap
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any
 
 from engram_benchmarks.shared.http_client import MockHttpFn, _word_count
-from engram_benchmarks.shared.results import BaseResult
+from engram_benchmarks.shared.results import SnapshotMode
 from engram_benchmarks.shared.runner import BaseTwoPhaseRunner
+
 from .results import LoCoMoResult, LoCoMoRunSummary
 from .scoring import TokenF1Scorer
-
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -46,7 +46,7 @@ class Question:
     session_id: str
     conversation_text: str      # full multi-session conversation (may be 300K+ chars)
     question: str
-    answer: Union[str, List[str]]  # str or list of acceptable answers
+    answer: str | list[str]  # str or list of acceptable answers
     question_type: str = "factual"  # e.g. "temporal", "single_hop", "multi_hop"
 
     def to_dict(self) -> dict:
@@ -54,7 +54,7 @@ class Question:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Question":
+    def from_dict(cls, d: dict) -> Question:
         return cls(
             question_id=d["question_id"],
             session_id=d["session_id"],
@@ -78,13 +78,20 @@ class LoCoMoRunner(BaseTwoPhaseRunner[Question]):
     - LoCoMoRunSummary (adds per-type warm F1 breakdown)
     """
 
+    _result_cls = LoCoMoResult
+
     def __init__(
         self,
         model_url: str,
         snapshot_dir: Path,
         model: str = "default",
         max_tokens: int = 256,
-        mock_fn: Optional[MockHttpFn] = None,
+        mock_fn: MockHttpFn | None = None,
+        snapshot_api_enabled: bool = False,
+        model_path: str = "",
+        warm_branch_prefix: str = "bm-warm",
+        snapshot_mode: SnapshotMode = "mamba_only",
+        admin_api_key: str | None = None,
     ) -> None:
         super().__init__(
             model_url=model_url,
@@ -93,6 +100,11 @@ class LoCoMoRunner(BaseTwoPhaseRunner[Question]):
             model=model,
             max_tokens=max_tokens,
             mock_fn=mock_fn,
+            snapshot_api_enabled=snapshot_api_enabled,
+            model_path=model_path,
+            warm_branch_prefix=warm_branch_prefix,
+            snapshot_mode=snapshot_mode,
+            admin_api_key=admin_api_key,
         )
 
     # ------------------------------------------------------------------ #
@@ -137,75 +149,9 @@ class LoCoMoRunner(BaseTwoPhaseRunner[Question]):
             "question_type": item.question_type,
         }
 
-    # ------------------------------------------------------------------ #
-    # Override run_all to produce LoCoMoResult instead of BaseResult      #
-    # ------------------------------------------------------------------ #
-
-    def run_all(self, items: List[Question]) -> List[LoCoMoResult]:
-        """Run baseline → cold Engram → warm Engram for each question.
-
-        Fully overrides BaseTwoPhaseRunner.run_all to construct LoCoMoResult
-        (which has extra fields session_id, question_type) rather than the
-        base BaseResult.
-
-        For each item:
-          1. Baseline  — full context prompt, no snapshot.
-          2. Cold pass — full context prompt, saves snapshot (NOT reported as warm).
-          3. Warm pass — question-only prompt, snapshot present (reported as warm).
-        """
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
-
-        results: List[LoCoMoResult] = []
-        for item in items:
-            item_id = self._item_id(item)
-            full_prompt = self._build_full_prompt(item)
-            warm_prompt = self._build_warm_prompt(item)
-            ref = self._reference_answer(item)
-
-            # --- 1. Baseline ---
-            b = self._call(full_prompt)
-            b_score = self.scorer.score(b.text, ref)
-
-            # --- 2. Cold Engram pass (establishes snapshot; metrics not reported) ---
-            self._call(full_prompt)          # discard cold latency
-            self._write_snapshot(item, full_prompt)
-
-            # --- 3. Warm Engram pass (snapshot now present) ---
-            assert self._snap_exists(item), "Snapshot must exist after cold pass"
-            w = self._call(warm_prompt)
-            w_score = self.scorer.score(w.text, ref)
-
-            results.append(
-                LoCoMoResult(
-                    item_id=item_id,
-                    restore_mode="warm",  # deliberate warm — always warm here
-                    baseline_ttft_s=b.ttft_s,
-                    baseline_input_tokens=b.input_tokens,
-                    baseline_output_tokens=b.output_tokens,
-                    baseline_answer=b.text,
-                    baseline_score=b_score,
-                    engram_ttft_s=w.ttft_s,
-                    engram_input_tokens=w.input_tokens,
-                    engram_output_tokens=w.output_tokens,
-                    engram_answer=w.text,
-                    engram_score=w_score,
-                    session_id=item.session_id,
-                    question_type=item.question_type,
-                )
-            )
-            _logger.info(
-                "%s | baseline_ttft=%.3fs warm_ttft=%.3fs token_reduction=%.2f",
-                item_id,
-                b.ttft_s,
-                w.ttft_s,
-                results[-1].token_reduction,
-            )
-        return results
-
     def build_summary(
         self,
-        results: List[LoCoMoResult],
+        results: list[LoCoMoResult],
         model: str = "default",
     ) -> LoCoMoRunSummary:
         """Wrap results in a LoCoMoRunSummary."""
@@ -220,14 +166,14 @@ class LoCoMoRunner(BaseTwoPhaseRunner[Question]):
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def load_questions(path: "str | Path") -> List[Question]:
+def load_questions(path: str | Path) -> list[Question]:
     """Load questions from a JSONL file (one Question JSON per line).
 
     The JSONL format produced by ``download.py`` and ``generate_dry_run_data``
     has one serialised Question dict per line (no header line).
     """
     path = Path(path)
-    questions: List[Question] = []
+    questions: list[Question] = []
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -322,7 +268,7 @@ _DRY_RUN_ITEMS = [
 ]
 
 
-def generate_dry_run_questions(n: int = 5) -> List[Question]:
+def generate_dry_run_questions(n: int = 5) -> list[Question]:
     """Return up to ``n`` synthetic LoCoMo questions for CPU dry-run testing.
 
     Each question uses the same synthetic multi-session conversation (~500 words)
