@@ -253,7 +253,7 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
     # HTTP helper                                                          #
     # ------------------------------------------------------------------ #
 
-    def _call(self, prompt: str) -> ChatResult:
+    def _call(self, prompt: str, rid: Optional[str] = None) -> ChatResult:
         messages = [{"role": "user", "content": prompt}]
         input_tokens = _word_count(prompt)
         return chat_completion(
@@ -262,6 +262,7 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
             model=self.model,
             max_tokens=self.max_tokens,
             input_token_count=input_tokens,
+            rid=rid,
             mock_fn=self.mock_fn,
         )
 
@@ -294,25 +295,34 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
             b = self._call(full_prompt)
             b_score = scorer.score(b.text, ref)
 
-            # 2. Cold pass — establish snapshot
-            cold_result = self._call(full_prompt)
-            cold_rid = getattr(cold_result, "rid", item_id)  # rid if server sends it
+            # 2. Cold pass — establish snapshot.
+            # Pass rid=item_id so the server tracks this request under a key
+            # we control; /save_snapshot(rid=item_id) will find it.
+            self._call(full_prompt, rid=item_id)
 
+            restore_success: bool
             if self.snapshot_api_enabled:
-                self._server_save_snapshot(item, rid=cold_rid)
+                self._server_save_snapshot(item, rid=item_id)
                 restored = self._server_restore_snapshot(item)
                 if not restored:
-                    logger.warning("Warm restore failed for %s; labelling cold", item_id)
+                    logger.warning(
+                        "Warm restore failed for %s; labelling cold. "
+                        "Content match on this result is a false positive.",
+                        item_id,
+                    )
                     restore_mode: Literal["warm", "cold"] = "cold"
+                    restore_success = False
                     w = self._call(full_prompt)  # fall back to full prompt
                 else:
                     restore_mode = "warm"
+                    restore_success = True
                     w = self._call(warm_prompt)
             else:
                 # Dry-run: local stub simulates warm/cold
                 self._write_stub(item, full_prompt)
                 assert self._stub_exists(item), "Stub must exist after cold pass"
                 restore_mode = "warm"
+                restore_success = True
                 w = self._call(warm_prompt)
 
             w_score = scorer.score(w.text, ref)
@@ -323,6 +333,7 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
                     item_id=item_id,
                     restore_mode=restore_mode,
                     snapshot_mode=self.snapshot_mode,
+                    restore_success=restore_success,
                     baseline_ttft_s=b.ttft_s,
                     baseline_input_tokens=b.input_tokens,
                     baseline_output_tokens=b.output_tokens,
@@ -358,6 +369,7 @@ class BaseTwoPhaseRunner(ABC, Generic[ItemT]):
                     item_id=self._item_id(item),
                     restore_mode="cold",
                     snapshot_mode=self.snapshot_mode,
+                    restore_success=False,
                     baseline_ttft_s=b.ttft_s,
                     baseline_input_tokens=b.input_tokens,
                     baseline_output_tokens=b.output_tokens,

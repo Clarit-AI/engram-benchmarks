@@ -57,6 +57,12 @@ class BaseResult:
     # Run-level tag — kept last so subclass fields with defaults stay valid
     snapshot_mode: SnapshotMode = "mamba_only"
 
+    # Tracks whether the /restore_snapshot RPC succeeded.  False means the
+    # runner fell back to the full prompt; any content match on that result
+    # is a false positive, not proof of warm restore.  Always True in dry-run
+    # mode (stub path never fails).
+    restore_success: bool = True
+
     # ------------------------------------------------------------------ #
     # Derived metrics                                                      #
     # ------------------------------------------------------------------ #
@@ -151,7 +157,7 @@ class RunSummary:
 
     @property
     def warm_results(self) -> List[BaseResult]:
-        return [r for r in self.results if r.restore_mode == "warm"]
+        return [r for r in self.results if r.restore_mode == "warm" and r.restore_success]
 
     @property
     def cold_results(self) -> List[BaseResult]:

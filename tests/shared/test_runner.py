@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from pathlib import Path
 
 from engram_benchmarks.shared.http_client import ChatResult, make_dry_run_mock
-from engram_benchmarks.shared.results import BaseResult, SnapshotMode
+from engram_benchmarks.shared.results import BaseResult, RunSummary, SnapshotMode
 from engram_benchmarks.shared.runner import BaseTwoPhaseRunner
 from engram_benchmarks.shared.scoring import MockScorer
 
@@ -240,3 +240,144 @@ class TestSnapshotApiEnabled:
 
         results = runner.run_all([item])
         assert results[0].restore_mode == "cold"
+        assert results[0].restore_success is False
+
+
+class TestRidPropagation:
+    """Cold pass must send rid=item_id so the server can find the request."""
+
+    def test_cold_pass_sends_rid_to_chat_completion(self, tmp_path):
+        """chat_completion is called with rid=item_id on the cold pass only."""
+        item = _Item("q1", "A" * 500, "What is the answer?", "42")
+        runner = _ConcreteRunner(
+            model_url="http://unused",
+            snapshot_dir=tmp_path / "snapshots",
+            scorer=MockScorer(),
+            snapshot_api_enabled=True,
+        )
+        runner._server_save_snapshot = MagicMock(return_value=True)
+        runner._server_restore_snapshot = MagicMock(return_value=True)
+
+        with patch("engram_benchmarks.shared.runner.chat_completion") as mock_cc:
+            mock_cc.return_value = ChatResult("42", 0.042, 0.150, 10, 1)
+            runner.run_all([item])
+
+        # 3 calls per item: baseline, cold pass, warm pass
+        assert mock_cc.call_count == 3
+        calls_list = mock_cc.call_args_list
+        # Cold pass is the second call; only it carries rid=item_id
+        cold_kwargs = calls_list[1].kwargs
+        assert cold_kwargs.get("rid") == "q1", (
+            "Cold pass must send rid=item_id so /save_snapshot can locate state"
+        )
+        # Baseline and warm pass must NOT carry rid
+        assert calls_list[0].kwargs.get("rid") is None, "Baseline must not set rid"
+        assert calls_list[2].kwargs.get("rid") is None, "Warm pass must not set rid"
+
+    def test_save_snapshot_receives_item_id_as_rid(self, tmp_path):
+        """_server_save_snapshot is called with rid=item_id, not a server-assigned key."""
+        item = _Item("item-abc", "Context", "Question?", "Answer")
+        mock = make_dry_run_mock(answer="Answer")
+        runner = _ConcreteRunner(
+            model_url="http://unused",
+            snapshot_dir=tmp_path / "snapshots",
+            scorer=MockScorer(),
+            mock_fn=mock,
+            snapshot_api_enabled=True,
+        )
+        save_mock = MagicMock(return_value=True)
+        runner._server_save_snapshot = save_mock
+        runner._server_restore_snapshot = MagicMock(return_value=True)
+
+        runner.run_all([item])
+
+        save_mock.assert_called_once()
+        _, kwargs = save_mock.call_args
+        assert kwargs["rid"] == "item-abc", (
+            "save_snapshot rid must match item_id, not a server-assigned unknown key"
+        )
+
+
+class TestColdFallbackValidation:
+    """Cold fallback with correct content must not pass as a warm result."""
+
+    def test_restore_failure_sets_restore_success_false(self, tmp_path):
+        item = _Item("q1", "Context", "Question?", "42")
+        mock = make_dry_run_mock(answer="42")
+        runner = _ConcreteRunner(
+            model_url="http://unused",
+            snapshot_dir=tmp_path / "snapshots",
+            scorer=MockScorer(),
+            mock_fn=mock,
+            snapshot_api_enabled=True,
+        )
+        runner._server_save_snapshot = MagicMock(return_value=True)
+        runner._server_restore_snapshot = MagicMock(return_value=False)
+
+        results = runner.run_all([item])
+        assert results[0].restore_success is False
+
+    def test_successful_restore_sets_restore_success_true(self, tmp_path):
+        item = _Item("q1", "Context", "Question?", "42")
+        mock = make_dry_run_mock(answer="42")
+        runner = _ConcreteRunner(
+            model_url="http://unused",
+            snapshot_dir=tmp_path / "snapshots",
+            scorer=MockScorer(),
+            mock_fn=mock,
+            snapshot_api_enabled=True,
+        )
+        runner._server_save_snapshot = MagicMock(return_value=True)
+        runner._server_restore_snapshot = MagicMock(return_value=True)
+
+        results = runner.run_all([item])
+        assert results[0].restore_success is True
+
+    def test_cold_fallback_excluded_from_warm_results_even_when_content_matches(
+        self, tmp_path
+    ):
+        """
+        The smoke false-positive scenario: restore fails, runner falls back to
+        full prompt (which contains the answer), content check passes.
+        RunSummary.warm_results must exclude this result.
+        """
+        item = _Item(
+            "secret-item",
+            "The secret code is ZEPHYR-7749.",
+            "What is the secret code?",
+            "ZEPHYR-7749",
+        )
+        # Mock always returns the answer — simulates full-prompt fallback
+        mock = make_dry_run_mock(answer="ZEPHYR-7749")
+        runner = _ConcreteRunner(
+            model_url="http://unused",
+            snapshot_dir=tmp_path / "snapshots",
+            scorer=MockScorer(),
+            mock_fn=mock,
+            snapshot_api_enabled=True,
+        )
+        runner._server_save_snapshot = MagicMock(return_value=True)
+        runner._server_restore_snapshot = MagicMock(return_value=False)  # restore fails
+
+        results = runner.run_all([item])
+        result = results[0]
+
+        # Content matched but restore failed — this is the false-positive pattern
+        assert result.restore_mode == "cold"
+        assert result.restore_success is False
+
+        # RunSummary must not include this in warm aggregates
+        summary = RunSummary(benchmark="test", model="test", results=results)
+        assert len(summary.warm_results) == 0, (
+            "Cold-fallback result must not appear in warm_results even if content matched"
+        )
+
+    def test_dry_run_restore_success_is_true(self, runner, items):
+        """In dry-run mode (stub path), restore_success is always True."""
+        results = runner.run_all(items)
+        assert all(r.restore_success is True for r in results)
+
+    def test_baseline_only_restore_success_is_false(self, runner, items):
+        """run_baseline_only has no restore attempt; restore_success=False."""
+        results = runner.run_baseline_only(items)
+        assert all(r.restore_success is False for r in results)
