@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 
-S3_BUCKET = "s3://engram/benchmarks"
+S3_BUCKET = "s3://engram-dev-sync/benchmarks"
 S3CMD_CONFIG = "~/.s3cfg"  # expects sfo3 endpoint configured
 
 
