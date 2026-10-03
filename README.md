@@ -2,7 +2,7 @@
 
 HTTP-client benchmark suite for [Engram](https://github.com/Clarit-AI/Engram) stateful inference.
 
-Harnesses run against a server URL (never importing engine internals), comparing a stateless baseline against Engram's snapshot-backed stateful path. Results upload to `s3://engram/benchmarks/` via `s3cmd` (sfo3).
+Harnesses run against a server URL (never importing engine internals), comparing a stateless baseline against Engram's snapshot-backed stateful path. Results upload to `s3://engram-dev-sync/benchmarks/` via `s3cmd` (sfo3).
 
 ## Benchmarks
 
